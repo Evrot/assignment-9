@@ -4,38 +4,61 @@ const bcrypt = require('bcryptjs');
 const { db, User, Project, Task } = require('./database/setup');
 require('dotenv').config();
 
+const jwt = require('jsonwebtoken');
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 // Middleware
 app.use(express.json());
 
-// Session middleware (TODO: Replace with JWT)
-app.use(session({
-    secret: process.env.SESSION_SECRET,
-    resave: false,
-    saveUninitialized: false,
-    cookie: { 
-        secure: false,
-        maxAge: 24 * 60 * 60 * 1000 // 24 hours
-    }
-}));
 
-// TODO: Create JWT middleware to replace session auth
+// JWT Authentication middleware
 function requireAuth(req, res, next) {
-    if (req.session && req.session.userId) {
-        req.user = {
-            id: req.session.userId,
-            name: req.session.userName,
-            email: req.session.userEmail
-        };
-        next();
-    } else {
-        res.status(401).json({ 
-            error: 'Authentication required. Please log in.' 
-        });
+    const authHeader = req.headers['authorization']; // Expect "Bearer TOKEN"
+    const token = authHeader && authHeader.split(' ')[1];
+
+    if (!token) return res.status(401).json({ error: 'Authentication required. Please log in.' });
+
+    jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
+    if (err) {
+        if (err.name === 'TokenExpiredError') {
+            return res.status(403).json({ error: 'Token expired. Please log in again.' });
+        }
+        return res.status(403).json({ error: 'Invalid token. Access denied.' });
     }
+    req.user = { id: decoded.id, name: decoded.name, email: decoded.email, role: decoded.role };
+    next();
+});
 }
+
+// Middleware to allow only managers and admins
+function requireManager(req, res, next) {
+    if (!req.user) {
+        return res.status(401).json({ error: 'Authentication required.' });
+    }
+
+    const allowedRoles = ['manager', 'admin'];
+    if (!allowedRoles.includes(req.user.role)) {
+        return res.status(403).json({ error: 'Forbidden: Manager or Admin access required.' });
+    }
+
+    next();
+}
+
+// Middleware to allow only admins
+function requireAdmin(req, res, next) {
+    if (!req.user) {
+        return res.status(401).json({ error: 'Authentication required.' });
+    }
+
+    if (req.user.role !== 'admin') {
+        return res.status(403).json({ error: 'Forbidden: Admin access required.' });
+    }
+
+    next();
+}
+
 
 // Test database connection
 async function testConnection() {
@@ -54,7 +77,7 @@ testConnection();
 // POST /api/register - Register new user
 app.post('/api/register', async (req, res) => {
     try {
-        const { name, email, password } = req.body;
+        const { name, email, password, role } = req.body;
         
         // Check if user exists
         const existingUser = await User.findOne({ where: { email } });
@@ -69,8 +92,8 @@ app.post('/api/register', async (req, res) => {
         const newUser = await User.create({
             name,
             email,
-            password: hashedPassword
-            // TODO: Add role field
+            password: hashedPassword,
+            role
         });
         
         res.status(201).json({
@@ -78,7 +101,8 @@ app.post('/api/register', async (req, res) => {
             user: {
                 id: newUser.id,
                 name: newUser.name,
-                email: newUser.email
+                email: newUser.email,
+                role: newUser.role
             }
         });
         
@@ -88,35 +112,44 @@ app.post('/api/register', async (req, res) => {
     }
 });
 
-// POST /api/login - User login (TODO: Replace with JWT)
+// POST /api/login - User login (JWT version)
 app.post('/api/login', async (req, res) => {
     try {
         const { email, password } = req.body;
-        
+
         const user = await User.findOne({ where: { email } });
         if (!user) {
             return res.status(401).json({ error: 'Invalid email or password' });
         }
-        
+
         const isValidPassword = await bcrypt.compare(password, user.password);
         if (!isValidPassword) {
             return res.status(401).json({ error: 'Invalid email or password' });
         }
-        
-        // Create session (TODO: Replace with JWT)
-        req.session.userId = user.id;
-        req.session.userName = user.name;
-        req.session.userEmail = user.email;
-        
+
+        // Create JWT token
+        const token = jwt.sign(
+            {
+                id: user.id,
+                name: user.name,
+                email: user.email,
+                role: user.role 
+            },
+            process.env.JWT_SECRET,
+            { expiresIn: process.env.JWT_EXPIRES_IN } 
+        );
+
         res.json({
             message: 'Login successful',
+            token,
             user: {
                 id: user.id,
                 name: user.name,
-                email: user.email
+                email: user.email,
+                role: user.role
             }
         });
-        
+
     } catch (error) {
         console.error('Error logging in user:', error);
         res.status(500).json({ error: 'Failed to login' });
@@ -125,12 +158,7 @@ app.post('/api/login', async (req, res) => {
 
 // POST /api/logout - User logout
 app.post('/api/logout', (req, res) => {
-    req.session.destroy((err) => {
-        if (err) {
-            return res.status(500).json({ error: 'Failed to logout' });
-        }
-        res.json({ message: 'Logout successful' });
-    });
+    res.json({ message: 'Logout successful. Please delete your token on the client side.' });
 });
 
 // USER ROUTES
@@ -139,7 +167,7 @@ app.post('/api/logout', (req, res) => {
 app.get('/api/users/profile', requireAuth, async (req, res) => {
     try {
         const user = await User.findByPk(req.user.id, {
-            attributes: ['id', 'name', 'email'] // Don't return password
+            attributes: ['id', 'name', 'email', 'role'] // Don't return password
         });
         
         if (!user) {
@@ -153,11 +181,11 @@ app.get('/api/users/profile', requireAuth, async (req, res) => {
     }
 });
 
-// GET /api/users - Get all users (TODO: Admin only)
-app.get('/api/users', requireAuth, async (req, res) => {
+// GET /api/users - Get all users (Admin only)
+app.get('/api/users', requireAuth, requireAdmin, async (req, res) => {
     try {
         const users = await User.findAll({
-            attributes: ['id', 'name', 'email'] // Don't return passwords
+            attributes: ['id', 'name', 'email', 'role'] // Don't return passwords
         });
         
         res.json(users);
@@ -223,16 +251,16 @@ app.get('/api/projects/:id', requireAuth, async (req, res) => {
     }
 });
 
-// POST /api/projects - Create new project (TODO: Manager+ only)
-app.post('/api/projects', requireAuth, async (req, res) => {
+// POST /api/projects - Create Project (Manager+ only)
+app.post('/api/projects', requireAuth, requireManager, async (req, res) => {
     try {
-        const { name, description, status = 'active' } = req.body;
+        const { name, description, status} = req.body;
         
         const newProject = await Project.create({
             name,
-            description,
-            status,
-            managerId: req.user.id
+            description,           
+            managerId: req.user.id,
+            status
         });
         
         res.status(201).json(newProject);
@@ -242,8 +270,8 @@ app.post('/api/projects', requireAuth, async (req, res) => {
     }
 });
 
-// PUT /api/projects/:id - Update project (TODO: Manager+ only)
-app.put('/api/projects/:id', requireAuth, async (req, res) => {
+// PUT /api/projects/:id - Update project (Manager+ only)
+app.put('/api/projects/:id', requireAuth, requireManager, async (req, res) => {
     try {
         const { name, description, status } = req.body;
         
@@ -264,8 +292,8 @@ app.put('/api/projects/:id', requireAuth, async (req, res) => {
     }
 });
 
-// DELETE /api/projects/:id - Delete project (TODO: Admin only)
-app.delete('/api/projects/:id', requireAuth, async (req, res) => {
+// DELETE /api/projects/:id - Delete project (Admin only)
+app.delete('/api/projects/:id', requireAuth, requireAdmin, async (req, res) => {
     try {
         const deletedRowsCount = await Project.destroy({
             where: { id: req.params.id }
@@ -305,8 +333,8 @@ app.get('/api/projects/:id/tasks', requireAuth, async (req, res) => {
     }
 });
 
-// POST /api/projects/:id/tasks - Create task (TODO: Manager+ only)
-app.post('/api/projects/:id/tasks', requireAuth, async (req, res) => {
+// POST /api/projects/:id/tasks - Create task (Manager+ only)
+app.post('/api/projects/:id/tasks', requireAuth, requireManager, async (req, res) => {
     try {
         const { title, description, assignedUserId, priority = 'medium' } = req.body;
         
@@ -348,8 +376,8 @@ app.put('/api/tasks/:id', requireAuth, async (req, res) => {
     }
 });
 
-// DELETE /api/tasks/:id - Delete task (TODO: Manager+ only)
-app.delete('/api/tasks/:id', requireAuth, async (req, res) => {
+// DELETE /api/tasks/:id - Delete task (Manager+ only)
+app.delete('/api/tasks/:id', requireAuth, requireManager, async (req, res) => {
     try {
         const deletedRowsCount = await Task.destroy({
             where: { id: req.params.id }

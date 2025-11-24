@@ -5,7 +5,7 @@ require('dotenv').config();
 const db = new Sequelize({
     dialect: process.env.DB_TYPE,
     storage: `database/${process.env.DB_NAME}` || 'database/company_projects.db',
-    logging: false
+    logging: false,    
 });
 
 // User Model
@@ -28,7 +28,15 @@ const User = db.define('User', {
         type: DataTypes.STRING,
         allowNull: false
     },
-    // TODO: Add role field (employee, manager, admin)
+
+    role: {
+        type: DataTypes.STRING,
+        allowNull: false,        
+        defaultValue: 'employee',
+        validate: {
+            isIn: [['employee', 'manager', 'admin']]
+        }
+    }    
 });
 
 // Project Model
